@@ -1,0 +1,9 @@
+{
+  "id": "knowmeld-sync",
+  "name": "Knowmeld Sync",
+  "version": "1.0.0",
+  "minAppVersion": "1.0.0",
+  "description": "Sync vault markdown files to Knowmeld API",
+  "author": "",
+  "isDesktopOnly": false
+}
