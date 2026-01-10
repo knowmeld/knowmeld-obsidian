@@ -1,24 +1,9 @@
-import { App, PluginSettingTab, Setting } from "obsidian";
+import {
+  App, PluginSettingTab, Setting,
+} from "obsidian";
 import type KnowmeldPlugin from "./main";
+import { KnowmeldSettingStore } from "./settings.store";
 
-export interface KnowmeldSettings {
-  apiUrl: string;
-  apiKey: string;
-  // realtimeSync: boolean;
-  excludedFolders: string[];
-}
-
-export interface KnowmeldSettingStore {
-  get(): KnowmeldSettings;
-  set(setting: Record<string, string | boolean | string[]>): void;
-}
-
-export const DEFAULT_SETTINGS: KnowmeldSettings = {
-  apiUrl: "http://localhost:8000/upload/obsidian",
-  apiKey: "",
-  // realtimeSync: false,
-  excludedFolders: [],
-};
 
 export class KnowmeldSettingTab extends PluginSettingTab {
   plugin: KnowmeldPlugin;
@@ -34,19 +19,14 @@ export class KnowmeldSettingTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
 
-    new Setting(containerEl)
-      .setName("API Key")
-      .setDesc("Authentication key for the API")
-      .addText((text) => {
-        text
-          .setPlaceholder("Enter your API key")
-          .setValue(this.settingsStore.get().apiKey)
-          .onChange(async (value) => {
-            this.settingsStore.set({ apiKey: value });
-            await this.plugin.persistData();
-          });
-        text.inputEl.type = "password";
-      });
+    new Setting(containerEl).setName("Connect to Knowmeld")
+      .setDesc("This registers your Obsidian with Knowmeld for sync")
+      .addButton((btn) =>
+        btn.setButtonText("Connect").onClick(async () => {
+          window.open(
+            `${this.settingsStore.get().apiUrl}/dashboard/obsidian/connect?device_id=${this.settingsStore.get().deviceId}`
+          )
+        })).setDisabled(!!this.settingsStore.get().refreshToken);
 
     // new Setting(containerEl)
     //   .setName("Real-time sync")

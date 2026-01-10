@@ -1,7 +1,8 @@
-import { Plugin } from "obsidian";
+import { Notice, Plugin } from "obsidian";
 
 import { FileSyncer, PersistedCache } from "./syncer";
-import { KnowmeldSettings, KnowmeldSettingTab, DEFAULT_SETTINGS } from "./settings";
+import { KnowmeldSettingTab } from "./settings";
+import { DEFAULT_SETTINGS, KnowmeldSettings } from "./settings.store";
 
 type PersistedData = {
   cache: CacheData;
@@ -13,12 +14,14 @@ interface CacheData {
   [path: string]: string;
 }
 
+
+
 export default class KnowmeldPlugin extends Plugin {
   private syncer!: FileSyncer;
+  private settingTab!: KnowmeldSettingTab;
 
   private data: PersistedData = {
     cache: {},
-    log: "",
     settings: DEFAULT_SETTINGS,
   };
 
@@ -26,7 +29,6 @@ export default class KnowmeldPlugin extends Plugin {
     const loadedData: Partial<PersistedData> = await this.loadData();
     this.data = {
       cache: loadedData?.cache || {},
-      log: loadedData?.log || "",
       settings: { ...DEFAULT_SETTINGS, ...loadedData?.settings },
     }
     const cacheStore: PersistedCache = {
@@ -53,10 +55,37 @@ export default class KnowmeldPlugin extends Plugin {
         this.data.settings = { ...this.data.settings, ...setting };
       }
     };
-
+    this.settingTab = new KnowmeldSettingTab(this.app, this, settingsStore)
     this.syncer = new FileSyncer(this.app.vault, cacheStore, settingsStore);
+    this.addSettingTab(this.settingTab);
+    this.registerObsidianProtocolHandler("knowmeld-auth", async (params) => {
+      const { pairingCode } = params;
+      if (pairingCode) {
+        const formData = new FormData();
+        formData.append("pairing_code", pairingCode as string);
+        formData.append("device_id", this.data.settings.deviceId);
+        const resp = await fetch(`${this.data.settings.apiUrl}/v1/auth/device-tokens/pairing-complete`, {
+          method: "POST",
+          body: formData,
+        });
+        if (!resp.ok) {
+          new Notice("Knowmeld: Failed to connect device.");
+          return;
+        }
+        const data = await resp.json();
+        if (data.access_token && data.refresh_token) {
+          this.data.settings.accessToken = data.access_token;
+          this.data.settings.refreshToken = data.refresh_token;
+        }
+        await this.persistData();
+        new Notice("Knowmeld: Device successfully connected!");
+        this.settingTab.display();
+      } else {
+        new Notice("Knowmeld: Failed to connect device. Could not retrieve code from server. Please try again.");
+      }
+    });
 
-    this.addSettingTab(new KnowmeldSettingTab(this.app, this, settingsStore));
+
 
     this.addRibbonIcon("refresh-cw", "Sync all to Knowmeld", async () => {
       await this.syncer.syncAll();
@@ -65,8 +94,13 @@ export default class KnowmeldPlugin extends Plugin {
     this.addCommand({
       id: "sync-all",
       name: "Sync all files to Knowmeld",
-      callback: async () => {
-        await this.syncer.syncAll();
+      checkCallback: (checking: boolean) => {
+        const connected = !!this.data.settings.refreshToken;
+        if (!connected && !checking) {
+          new Notice("Knowmeld: Your device has not been connected. Please connect in the settings.");
+          return;
+        }
+        this.syncer.syncAll();
       },
     });
 
@@ -75,6 +109,11 @@ export default class KnowmeldPlugin extends Plugin {
       name: "Sync current file to Knowmeld",
       checkCallback: (checking: boolean) => {
         const file = this.app.workspace.getActiveFile();
+        const connected = !!this.data.settings.refreshToken;
+        if (!connected && !checking) {
+          new Notice("Knowmeld: Your device has not been connected. Please connect in the settings.");
+          return false;
+        }
         if (file && file.path.endsWith(".md")) {
           if (!checking) {
             this.syncer.syncFile(file);
