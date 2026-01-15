@@ -14,6 +14,9 @@ esbuild.build({
   treeShaking: true,
   outfile: "dist/main.js",
   minify: prod,
+  define: {
+    "process.env.NODE_ENV": prod ? '"production"' : '"development"',
+  },
 }).catch(() => process.exit(1));
 
 

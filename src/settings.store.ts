@@ -1,4 +1,5 @@
 export interface KnowmeldSettings {
+    dashboardUrl?: string;
     apiUrl: string;
     deviceId: string;
     accessToken?: string;
@@ -12,7 +13,12 @@ export interface KnowmeldSettingStore {
 }
 
 export const DEFAULT_SETTINGS: KnowmeldSettings = {
-    apiUrl: "http://localhost:8000",
+    apiUrl: process.env.NODE_ENV === "production"
+        ? "https://api.knowmeld.io/v1"
+        : "http://localhost:8000/v1",
+    dashboardUrl: process.env.NODE_ENV === "production"
+        ? "https://dashboard.knowmeld.io"
+        : "http://localhost:8000",
     deviceId: crypto.randomUUID(),
     // realtimeSync: false,
     excludedFolders: [],
