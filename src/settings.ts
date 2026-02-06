@@ -4,42 +4,74 @@ import {
 import type KnowmeldPlugin from "./main";
 import { KnowmeldSettingStore } from "./settings.store";
 
+interface IAuthenticator {
+  connect(isConnected: boolean): Promise<void>;
+  disconnect(): Promise<void>;
+}
 
 export class KnowmeldSettingTab extends PluginSettingTab {
   plugin: KnowmeldPlugin;
   settingsStore: KnowmeldSettingStore;
+  authenticator: IAuthenticator;
 
-  constructor(app: App, plugin: KnowmeldPlugin, settingsStore: KnowmeldSettingStore) {
+  constructor(app: App, plugin: KnowmeldPlugin, settingsStore: KnowmeldSettingStore, authenticator: IAuthenticator) {
     super(app, plugin);
     this.plugin = plugin;
     this.settingsStore = settingsStore;
+    this.authenticator = authenticator;
   }
 
   display(): void {
     const { containerEl } = this;
     containerEl.empty();
+    const settings = this.settingsStore.get();
+    const isConnected = settings.authDetails ? true : false;
 
-    new Setting(containerEl).setName("Connect to Knowmeld")
+    // Connect/Reconnect button
+
+    new Setting(containerEl)
+      .setName("Connect to Knowmeld")
       .setDesc("This registers your Obsidian with Knowmeld for sync")
       .addButton((btn) =>
-        btn.setButtonText("Connect").onClick(async () => {
-          window.open(
-            `${this.settingsStore.get().dashboardUrl}/dashboard/obsidian/connect?device_id=${this.settingsStore.get().deviceId}`
-          )
-        })).setDisabled(!!this.settingsStore.get().refreshToken);
+        btn.setButtonText(isConnected ? "Reconnect" : "Connect").onClick(async () => {
+          await this.authenticator.connect(isConnected);
+          this.display(); // Refresh the settings UI
+        })
+      );
 
-    // new Setting(containerEl)
-    //   .setName("Real-time sync")
-    //   .setDesc("Automatically sync files when they are modified")
-    //   .addToggle((toggle) =>
-    //     toggle
-    //       .setValue(this.settingsStore.get().realtimeSync)
-    //       .onChange(async (value) => {
-    //         this.settingsStore.set({ realtimeSync: value });
-    //         await this.plugin.persistData();
-    //       })
-    //   );
 
+    // Disconnect button (only shown when connected)
+    if (isConnected) {
+      new Setting(containerEl)
+        .setName("Disconnect from Knowmeld")
+        .setDesc("Remove the connection to Knowmeld")
+        .addButton((btn) =>
+          btn
+            .setButtonText("Disconnect")
+            .setWarning()
+            .onClick(async () => {
+              await this.authenticator.disconnect();
+              this.display(); // Refresh the settings UI
+            })
+        );
+    }
+
+    // Real-time sync interval slider
+    new Setting(containerEl)
+      .setName("Real-time sync interval")
+      .setDesc(`Sync files automatically after this many minutes of inactivity (${Math.round(this.settingsStore.get().realtimeSyncInterval / 60)} min)`)
+      .addSlider((slider) =>
+        slider
+          .setLimits(2, 10, 1)
+          .setValue(Math.round(this.settingsStore.get().realtimeSyncInterval / 60))
+          .setDynamicTooltip()
+          .onChange(async (value) => {
+            const seconds = Math.max(value, 2) * 60; // Enforce minimum of 2 minutes
+            this.settingsStore.set({ realtimeSyncInterval: seconds });
+            await this.plugin.persistData();
+            this.display(); // Refresh to update description
+          })
+      );
 
     new Setting(containerEl)
       .setName("Excluded folders")

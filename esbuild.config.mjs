@@ -12,7 +12,7 @@ esbuild.build({
   logLevel: "info",
   sourcemap: prod ? false : "inline",
   treeShaking: true,
-  outfile: "dist/main.js",
+  outfile: prod ? "dist_prod/main.js" : "dist/main.js",
   minify: prod,
   define: {
     "process.env.NODE_ENV": prod ? '"production"' : '"development"',

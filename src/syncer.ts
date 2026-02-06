@@ -1,10 +1,16 @@
-import { TFile, Vault, Notice, getFrontMatterInfo } from "obsidian";
+import { TFile, Vault, Notice, getFrontMatterInfo, App } from "obsidian";
 import { KnowmeldSettingStore } from "./settings.store";
+import * as path from "path/win32";
+
 
 
 const MIN_CONTENT_LENGTH = 500;
 
-export interface PersistedCache {
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+interface PersistedCache {
   get(path: string): string | undefined;
   set(path: string, hash: string): void;
   remove(path: string): void;
@@ -18,85 +24,101 @@ enum SyncDecision {
   FAILED,
 }
 
+interface IAuthenticator {
+  ensureAuthenticated(): Promise<boolean>;
+  getAccessToken(): string;
+}
+
 export class FileSyncer {
   private vault: Vault;
   private cacheStore: PersistedCache;
   private settingsStore: KnowmeldSettingStore;
+  private authenticator: IAuthenticator;
+  private app: App;
 
 
-  constructor(vault: Vault, cacheStore: PersistedCache, settingStore: KnowmeldSettingStore) {
+  constructor(app: App, vault: Vault, cacheStore: PersistedCache, settingStore: KnowmeldSettingStore, authenticator: IAuthenticator) {
     this.vault = vault;
     this.cacheStore = cacheStore;
     this.settingsStore = settingStore;
+    this.authenticator = authenticator;
+    this.app = app;
   }
 
-
-  async uploadFile(file: TFile, uploadSessionId: string, correlationId: string): Promise<SyncDecision> {
+  async shouldSyncFile(file: TFile): Promise<ShouldSyncFileResult> {
     const settings = this.settingsStore.get();
-    if (settings.excludedFolders.some(folder => file.path.startsWith(folder))) {
-      console.log("Skipping because path is in excluded folders:", file.path);
-      return SyncDecision.SKIP;
-    }
-    if (file.path.startsWith("_")) {
-      console.log("Skipping because path starts with underscore:", file.path);
-      return SyncDecision.SKIP;
-    }
-    if (!file.path.endsWith(".md")) {
-      console.log("Skipping because not a markdown file:", file.path);
-      return SyncDecision.SKIP;
-    }
-
-    if (!settings.accessToken) {
-      new Notice("Knowmeld: Your device has not been connected. Please connect in the settings.");
-      return SyncDecision.FAILED;
-    }
 
     const content = await this.vault.read(file);
     let { contentStart } = getFrontMatterInfo(content);
     contentStart = contentStart ?? 0;
     const contentWithoutFrontMatter = content.slice(contentStart);
-
-    if (contentWithoutFrontMatter.trim().length < MIN_CONTENT_LENGTH) {
-      console.log("Skipping because content too short:", file.path);
-      return SyncDecision.SKIP;
-    }
-
     const hash = await hashContent(content);
     const cachedHash = this.cacheStore.get(file.path);
 
-    if (cachedHash === hash) {
-      console.log("Skipping because content unchanged:", file.path);
-      return SyncDecision.SKIP;
+    // Check if in excluded folders
+    if (settings.excludedFolders.some((folder: string) => file.path.startsWith(folder))) {
+      return { shouldSync: false, reason: "path is in excluded folders" };
     }
+
+    // Check if starts with underscore
+    if (file.path.startsWith("_")) {
+      return { shouldSync: false, reason: "path starts with underscore" };
+    }
+
+    // Check if markdown file
+    if (!file.path.endsWith(".md")) {
+      return { shouldSync: false, reason: "not a markdown file" };
+    }
+
+    // Check content length if provided
+    if (contentWithoutFrontMatter !== undefined) {
+      if (contentWithoutFrontMatter.trim().length < MIN_CONTENT_LENGTH) {
+        return { shouldSync: false, reason: "content too short" };
+      }
+    }
+
+    // Check if content unchanged if hashes provided
+    if (hash !== undefined && cachedHash !== undefined) {
+      if (hash === cachedHash) {
+        return { shouldSync: false, reason: "content unchanged" };
+      }
+    }
+
+    return { shouldSync: true, reason: "file should be synced" };
+  }
+
+
+  async uploadFile(file: TFile, sessionId: string): Promise<SyncDecision> {
+    const settings = this.settingsStore.get();
+
+    if (! await this.authenticator.ensureAuthenticated()) {
+      return SyncDecision.FAILED;
+    }
+
+    const content = await this.vault.read(file);
+    const hash = await hashContent(content);
 
     try {
       const formData = new FormData();
       const blob = new Blob([content], { type: "text/markdown" });
+
+      const metadata = { vault_name: this.vault.getName() };
+      formData.append("metadata", JSON.stringify(metadata));
       formData.append("file", blob, file.name);
       formData.append("file_path", file.path);
-      formData.append("vault_path", this.vault.getRoot().path);
-      formData.append("upload_session_id", uploadSessionId);
-      formData.append("correlation_id", correlationId);
+      formData.append("metadata", JSON.stringify(metadata));
 
-      const response = await fetch(`${settings.apiUrl}/upload`, {
+      const response = await fetch(`${settings.apiUrl}/files/upload`, {
         method: "POST",
         headers: {
-          Authorization: `Bearer ${settings.accessToken}`,
+          Authorization: `Bearer ${this.authenticator.getAccessToken()}`,
+          "X-Knowmeld-Correlation-ID": sessionId,
         },
         body: formData,
       });
 
       if (!response.ok) {
-        if (response.status === 401) {
-          const authenticated = await this.authenticate();
-          if (authenticated) {
-            return this.uploadFile(file, uploadSessionId, correlationId);
-          } else {
-            throw new Error("Authentication failed");
-          }
-        } else {
-          throw new Error(`HTTP ${response.status}`);
-        }
+        throw new Error(`HTTP ${response.status}`);
       }
 
       this.cacheStore.set(file.path, hash);
@@ -112,111 +134,87 @@ export class FileSyncer {
 
   async syncAll(): Promise<void> {
     const files = this.vault.getMarkdownFiles();
+    const filesToSync: TFile[] = [];
+    for (const file of files) {
+      const { shouldSync, reason } = await this.shouldSyncFile(file);
+      if (!shouldSync) {
+        console.log(`Skipping because file should not be synced: ${reason}`, file.path);
+        continue;
+      }
+      filesToSync.push(file);
+    }
+
+    if (filesToSync.length === 0) {
+      new Notice("Knowmeld: No files to sync.");
+      return;
+    }
+    await this.syncFiles(filesToSync);
+  }
+
+  async syncFiles(files: TFile[]): Promise<void> {
     let synced = 0;
     let skipped = 0;
 
-    const { upload_session_id, correlation_id } = await this.startSync() || {};
-    if (!upload_session_id || !correlation_id) {
+    const sessionId = await this.startSync();
+    if (!sessionId) {
       new Notice("Knowmeld: Unable to start sync session.");
       return;
     }
 
-    for (const file of files) {
-      const wasUploaded = await this.uploadFile(file, upload_session_id, correlation_id);
+    new Notice(`Knowmeld: Syncing ${files.length} files...`);
+
+
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+      const wasUploaded = await this.uploadFile(file, sessionId);
       if (wasUploaded === SyncDecision.SYNC) synced++;
       else if (wasUploaded === SyncDecision.SKIP) skipped++;
       else {
         new Notice(`Knowmeld: Stopping sync due to error.`);
         return;
       }
-      sleep(100); // brief pause to avoid overwhelming the server
+      await sleep(100); // brief pause to avoid overwhelming the server
+    }
+    if (synced) {
+      new Notice(`Knowmeld: Synced ${synced} files, ${skipped} unchanged`);
     }
 
-    new Notice(`Knowmeld: Synced ${synced} files, ${skipped} unchanged`);
-    await this.finishSync(upload_session_id);
+    await this.finishSync(sessionId);
   }
 
   async syncFile(file: TFile): Promise<void> {
-    const { upload_session_id, correlation_id } = await this.startSync() || {};
-    if (!upload_session_id || !correlation_id) {
-      new Notice("Knowmeld: Unable to start sync session.");
+    const { shouldSync, reason } = await this.shouldSyncFile(file);
+    if (!shouldSync) {
+      new Notice(`Knowmeld: File not synced: ${reason}`);
+      console.log(`Skipping because file should not be synced: ${reason}`, file.path);
       return;
     }
-
-    const wasUploaded = await this.uploadFile(file, upload_session_id, correlation_id);
-    if (wasUploaded === SyncDecision.SYNC) {
-      new Notice(`Knowmeld: Synced ${file.name}`);
-    } else if (wasUploaded === SyncDecision.SKIP) {
-      new Notice(`Knowmeld: No changes to sync for ${file.name}`);
-    }
-
-    await this.finishSync(upload_session_id);
+    await this.syncFiles([file]);
   }
 
-  async authenticate(): Promise<boolean> {
-    const settings = this.settingsStore.get();
-    if (!settings.accessToken) {
-      new Notice("Knowmeld: Your device has not been connected. Please connect in the settings.");
-      return false;
+
+  async startSync(): Promise<string | void> {
+    if (! await this.authenticator.ensureAuthenticated()) {
+      new Notice("Knowmeld: Authentication required to start sync session.");
+      return;
     }
-
     try {
-      const formData = new FormData();
-      formData.append("refresh_token", settings.refreshToken!);
-      const response = await fetch(`${settings.apiUrl}/auth/device-tokens/refresh`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${settings.accessToken}`,
-        },
-        body: formData,
-      });
-
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
-      }
-
-      const data = await response.json();
-      const { access_token, refresh_token } = data;
-
-      if (access_token) {
-        this.settingsStore.set({ accessToken: access_token, refreshToken: refresh_token });
-        this.cacheStore.save();
-      }
-
-      return true;
-    } catch (error) {
-      new Notice(`Knowmeld: Authentication failed`);
-      console.error("Authentication error:", error);
-      return false;
-    }
-  }
-
-  async startSync(): Promise<Record<string, string> | void> {
-    try {
-      const resp = await fetch(`${this.settingsStore.get().apiUrl}/upload/start`, {
+      const resp = await fetch(`${this.settingsStore.get().apiUrl}/files/upload`, {
         method: "GET",
         headers: {
-          Authorization: `Bearer ${this.settingsStore.get().accessToken}`,
-          "Idempotency-Key": crypto.randomUUID(),
+          Authorization: `Bearer ${this.authenticator.getAccessToken()}`,
+          "X-Idempotency-Key": crypto.randomUUID(),
         },
       });
       if (!resp.ok) {
-        if (!this.settingsStore.get().accessToken) {
-          new Notice("Knowmeld: Your device has not been connected. Please connect in the settings.");
-          return;
-        }
-        if (resp.status === 401) {
-          const authenticated = await this.authenticate();
-          if (authenticated) {
-            return this.startSync();
-          } else {
-            throw new Error("Authentication failed");
-          }
-        }
+        throw new Error("Authentication failed");
       }
-      const { upload_session_id, correlation_id } = await resp.json();
-      return { upload_session_id, correlation_id };
 
+      const sessionId = resp.headers.get("X-Knowmeld-Correlation-ID");
+      if (!sessionId) {
+        throw new Error("Knowmeld Error correlation ID missing in response");
+      }
+      return sessionId;
     } catch (error) {
       console.error("Sync start error:", error);
       new Notice("Knowmeld: Failed to start sync session");
@@ -224,25 +222,21 @@ export class FileSyncer {
     }
   }
 
-  async finishSync(uploadSessionId: string): Promise<void> {
+  async finishSync(sessionId: string): Promise<void> {
+    if (! await this.authenticator.ensureAuthenticated()) {
+      new Notice("Knowmeld: Authentication required to finish sync session.");
+      return;
+    }
     try {
-      const resp = await fetch(`${this.settingsStore.get().apiUrl}/upload/complete?upload_session_id=${uploadSessionId}`, {
-        method: "GET",
+      await fetch(`${this.settingsStore.get().apiUrl}/files/upload`, {
+        method: "DELETE",
         headers: {
-          Authorization: `Bearer ${this.settingsStore.get().accessToken}`,
+          Authorization: `Bearer ${this.authenticator.getAccessToken()}`,
           "Content-Type": "application/json",
+          "X-Knowmeld-Correlation-ID": sessionId,
         },
       });
-      if (!resp.ok) {
-        if (resp.status === 401) {
-          const authenticated = await this.authenticate();
-          if (authenticated) {
-            return this.finishSync(uploadSessionId);
-          } else {
-            throw new Error("Authentication failed");
-          }
-        }
-      }
+      new Notice("Knowmeld: Sync session completed successfully");
     } catch (error) {
       console.error("Sync finish error:", error);
       new Notice("Knowmeld: Failed to finish sync session");
@@ -259,6 +253,33 @@ export class FileSyncer {
   async handleRename(oldPath: string, newPath: string): Promise<void> {
     this.cacheStore.rename(oldPath, newPath);
   }
+
+  async sendDeletedFiles(paths: string[]): Promise<boolean> {
+    if (paths.length === 0) return true;
+
+    const settings = this.settingsStore.get();
+    this.authenticator.ensureAuthenticated();
+
+    try {
+      const response = await fetch(`${settings.apiUrl}/file`, {
+        method: "DELETE",
+        headers: {
+          Authorization: `Bearer ${this.authenticator.getAccessToken()}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ paths }),
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+
+      return true;
+    } catch (error) {
+      console.error("Failed to send deleted files:", error);
+      return false;
+    }
+  }
 }
 
 
@@ -269,3 +290,11 @@ export async function hashContent(content: string): Promise<string> {
   const hashArray = Array.from(new Uint8Array(hashBuffer));
   return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
 }
+
+
+
+export interface ShouldSyncFileResult {
+  shouldSync: boolean;
+  reason: string;
+}
+

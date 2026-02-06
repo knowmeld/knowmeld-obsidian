@@ -1,8 +1,9 @@
-import { Notice, Plugin } from "obsidian";
+import { Notice, Plugin, TAbstractFile, TFile } from "obsidian";
 
-import { FileSyncer, PersistedCache } from "./syncer";
+import { FileSyncer } from "./syncer";
 import { KnowmeldSettingTab } from "./settings";
 import { DEFAULT_SETTINGS, KnowmeldSettings } from "./settings.store";
+import { Authenticator } from "./authenticator";
 
 type PersistedData = {
   cache: CacheData;
@@ -14,11 +15,21 @@ interface CacheData {
   [path: string]: string;
 }
 
-
+interface PersistedCache {
+  get(path: string): string | undefined;
+  set(path: string, hash: string): void;
+  remove(path: string): void;
+  rename(oldPath: string, newPath: string): void;
+  save(): Promise<void>;
+}
 
 export default class KnowmeldPlugin extends Plugin {
   private syncer!: FileSyncer;
   private settingTab!: KnowmeldSettingTab;
+  private pendingFiles: Set<string> = new Set();
+  private syncTimeout: ReturnType<typeof setTimeout> | null = null;
+  private authenticator!: Authenticator;
+  private syncing: boolean = false;
 
   private data: PersistedData = {
     cache: {},
@@ -51,42 +62,29 @@ export default class KnowmeldPlugin extends Plugin {
     }
     const settingsStore = {
       get: (): KnowmeldSettings => this.data.settings,
-      set: (setting: Record<string, string | boolean>): void => {
+      set: (setting: Record<string, string | boolean | number | string[]>): void => {
         this.data.settings = { ...this.data.settings, ...setting };
       }
     };
-    this.settingTab = new KnowmeldSettingTab(this.app, this, settingsStore)
-    this.syncer = new FileSyncer(this.app.vault, cacheStore, settingsStore);
+    this.authenticator = new Authenticator(settingsStore, cacheStore);
+    this.settingTab = new KnowmeldSettingTab(this.app, this, settingsStore, this.authenticator);
+    this.syncer = new FileSyncer(this.app, this.app.vault, cacheStore, settingsStore, this.authenticator);
     this.addSettingTab(this.settingTab);
     this.registerObsidianProtocolHandler("knowmeld-auth", async (params) => {
       const { pairingCode, correlationId } = params;
-      if (pairingCode && correlationId) {
-        const formData = new FormData();
-        formData.append("pairing_code", pairingCode as string);
-        formData.append("correlation_id", correlationId as string);
-        formData.append("device_id", this.data.settings.deviceId);
-        const resp = await fetch(`${this.data.settings.apiUrl}/auth/device-tokens/pairing-complete`, {
-          method: "POST",
-          body: formData,
-        });
-        if (!resp.ok) {
-          new Notice("Knowmeld: Failed to connect device.");
-          return;
-        }
-        const data = await resp.json();
-        if (data.access_token && data.refresh_token) {
-          this.data.settings.accessToken = data.access_token;
-          this.data.settings.refreshToken = data.refresh_token;
-        }
-        await this.persistData();
-        new Notice("Knowmeld: Device successfully connected!");
-        this.settingTab.display();
-      } else {
-        new Notice("Knowmeld: Failed to connect device. Could not retrieve code from server. Please try again.");
+      if (!pairingCode || !correlationId) {
+        new Notice("Knowmeld: Could not get connection parameters. Please try again.");
+        return;
       }
+      this.authenticator.finishPairing(pairingCode, correlationId).then(async (success) => {
+        if (success) {
+          new Notice("Knowmeld: Device successfully connected!");
+          this.settingTab.display();
+        } else {
+          new Notice("Knowmeld: Failed to connect device. Could not retrieve code from server. Please try again.");
+        }
+      });
     });
-
-
 
     this.addRibbonIcon("refresh-cw", "Sync all to Knowmeld", async () => {
       await this.syncer.syncAll();
@@ -96,12 +94,17 @@ export default class KnowmeldPlugin extends Plugin {
       id: "sync-all",
       name: "Sync all files to Knowmeld",
       checkCallback: (checking: boolean) => {
-        const connected = !!this.data.settings.refreshToken;
-        if (!connected && !checking) {
+        const connected = this.authenticator.isConnected();
+
+        if (checking) return connected;
+
+        if (!connected) {
           new Notice("Knowmeld: Your device has not been connected. Please connect in the settings.");
-          return;
+          return false;
         }
+
         this.syncer.syncAll();
+        return true;
       },
     });
 
@@ -109,56 +112,140 @@ export default class KnowmeldPlugin extends Plugin {
       id: "sync-current",
       name: "Sync current file to Knowmeld",
       checkCallback: (checking: boolean) => {
+        const connected = this.authenticator.isConnected();
         const file = this.app.workspace.getActiveFile();
-        const connected = !!this.data.settings.refreshToken;
-        if (!connected && !checking) {
+        const ok = !!(connected && file && file.path.endsWith(".md"));
+
+        if (checking) return ok;
+
+        if (!connected) {
           new Notice("Knowmeld: Your device has not been connected. Please connect in the settings.");
           return false;
         }
         if (file && file.path.endsWith(".md")) {
-          if (!checking) {
-            this.syncer.syncFile(file);
-          }
+          this.syncer.syncFile(file);
           return true;
         }
         return false;
       },
     });
 
-    // this.registerEvent(
-    //   this.app.vault.on("modify", (file: TAbstractFile) => {
-    //     if (file instanceof TFile && file.path.endsWith(".md")) {
-    //       this.syncer.syncFile(file);
-    //     }
-    //   })
-    // );
 
-    // this.registerEvent(
-    //   this.app.vault.on("create", (file: TAbstractFile) => {
-    //     if (file instanceof TFile && file.path.endsWith(".md")) {
-    //       this.syncer.syncFile(file);
-    //     }
-    //   })
-    // );
+    let ready = false;
+    this.app.workspace.onLayoutReady(() => {
+      if (ready) return;
+      ready = true;
+    });
+
+    // Real-time sync: queue files on modify/create
+    this.registerEvent(
+      this.app.vault.on("modify", (file: TAbstractFile) => {
+        if (!ready) return;
+        if (file instanceof TFile && file.path.endsWith(".md")) {
+          this.queueFileForSync(file.path);
+        }
+      })
+    );
+
+    this.registerEvent(
+      this.app.vault.on("create", (file: TAbstractFile) => {
+        if (!ready) return;
+        if (file instanceof TFile && file.path.endsWith(".md")) {
+          console.log(`Knowmeld: Queuing created file ${file.path}`);
+          this.queueFileForSync(file.path);
+        }
+      })
+    );
+
+    // Track deleted files for batch notification
+    this.registerEvent(
+      this.app.vault.on("delete", (file: TAbstractFile) => {
+        if (!ready) return;
+        if (file.path.endsWith(".md")) {
+          console.log(`Knowmeld: Queuing deleted file ${file.path}`);
+          this.data.settings.deletedFiles.push(file.path);
+          this.persistData();
+          this.syncer.handleDelete(file.path);
+        }
+      })
+    );
+
+    // Handle renames: remove old path from cache, queue new path for sync
+    this.registerEvent(
+      this.app.vault.on("rename", (file: TAbstractFile, oldPath: string) => {
+        if (!ready) return;
+        if (file.path.endsWith(".md")) {
+          console.log(`Knowmeld: Handling renamed file ${oldPath} -> ${file.path}`);
+          this.syncer.handleRename(oldPath, file.path);
+          this.queueFileForSync(file.path);
+        }
+      })
+    );
+
+    // Flush deleted files every 10 minutes
+    this.registerInterval(
+      window.setInterval(() => this.flushDeletedFiles(), 10 * 60 * 1000)
+    );
+  }
 
 
-    // // TODO: Delete should do more than just remove from the cache
-    // this.registerEvent(
-    //   this.app.vault.on("delete", (file: TAbstractFile) => {
-    //     if (file.path.endsWith(".md")) {
-    //       this.syncer.handleDelete(file.path);
-    //     }
-    //   })
-    // );
+  private queueFileForSync(path: string): void {
+    if (!this.authenticator.isConnected()) return;
+    this.pendingFiles.add(path);
 
-    // // TODO: Rename should update the cache and possibly update the server
-    // this.registerEvent(
-    //   this.app.vault.on("rename", (file: TAbstractFile, oldPath: string) => {
-    //     if (file.path.endsWith(".md")) {
-    //       this.syncer.handleRename(oldPath, file.path);
-    //     }
-    //   })
-    // );
+    // Clear existing timeout
+    if (this.syncTimeout) {
+      clearTimeout(this.syncTimeout);
+    }
+
+    // Set new timeout based on configured interval
+    const intervalMs = this.data.settings.realtimeSyncInterval * 1000;
+    this.syncTimeout = setTimeout(() => {
+      this.syncPendingFiles();
+    }, intervalMs);
+  }
+
+  private async syncPendingFiles(): Promise<void> {
+    if (this.syncing) return;
+    if (this.pendingFiles.size === 0) return;
+    this.syncing = true;
+    try {
+      if (!await this.authenticator.ensureAuthenticated()) return;
+
+      const filesToSync = Array.from(this.pendingFiles);
+      this.pendingFiles.clear();
+      this.syncTimeout = null;
+      console.log(`Knowmeld: Syncing ${filesToSync.length} pending files...`);
+
+      // Get TFile objects for pending paths
+      const files: TFile[] = [];
+      for (const path of filesToSync) {
+        const file = this.app.vault.getAbstractFileByPath(path);
+        if (file instanceof TFile) {
+          files.push(file);
+        }
+      }
+
+      if (files.length === 0) return;
+
+      // Sync pending files
+      await this.syncer.syncFiles(files);
+
+    } finally {
+      this.syncing = false;
+    }
+  }
+
+  private async flushDeletedFiles(): Promise<void> {
+    const deletedFiles = this.data.settings.deletedFiles;
+    if (deletedFiles.length === 0) return;
+    if (!await this.authenticator.ensureAuthenticated()) return;
+
+    const success = await this.syncer.sendDeletedFiles(deletedFiles);
+    if (success) {
+      this.data.settings.deletedFiles = [];
+      await this.persistData();
+    }
   }
 
   async onunload(): Promise<void> {
