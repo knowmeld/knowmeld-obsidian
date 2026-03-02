@@ -7,12 +7,14 @@ export interface AuthDetails {
 }
 
 export interface KnowmeldSettings {
+    appUrl: string;
     apiUrl: string;
-    dashboardUrl?: string;
     authDetails?: AuthDetails;
     excludedFolders: string[];
     realtimeSyncInterval: number;  // seconds, default 120 (2 min)
     deletedDocumentIds: string[];   // document UUIDs pending deletion
+    vaultId: string;                // stable UUID generated on first install
+    vaultName: string;              // current vault name, updated on each load
 }
 
 export interface KnowmeldSettingStore {
@@ -21,14 +23,16 @@ export interface KnowmeldSettingStore {
 }
 
 export const DEFAULT_SETTINGS: KnowmeldSettings = {
+    appUrl: process.env.NODE_ENV === "production"
+        ? "https://app.knowmeld.io"
+        : "http://localhost:5173",
     apiUrl: process.env.NODE_ENV === "production"
-        ? "https://api.knowmeld.io/v1"
-        : "http://localhost:8000/v1",
-    dashboardUrl: process.env.NODE_ENV === "production"
-        ? "https://dashboard.knowmeld.io"
-        : "http://localhost:8000",
+        ? "https://app.knowmeld.io/api/v1"
+        : "http://localhost:8000/api/v1",
     authDetails: undefined,
     excludedFolders: [],
     realtimeSyncInterval: 120,
     deletedDocumentIds: [],
+    vaultId: "",
+    vaultName: "",
 };

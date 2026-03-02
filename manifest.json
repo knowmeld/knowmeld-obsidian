@@ -2,7 +2,7 @@
   "id": "knowmeld-sync",
   "name": "Knowmeld Sync",
   "version": "1.0.0",
-  "minAppVersion": "1.0.0",
+  "minAppVersion": "1.10.0",
   "description": "Sync vault markdown files to Knowmeld Knowledge Base",
   "author": "Knowmeld LTD.",
   "isDesktopOnly": false
