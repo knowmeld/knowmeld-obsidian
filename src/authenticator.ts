@@ -24,7 +24,7 @@ export class Authenticator {
 
         try {
             const formData = new FormData();
-            formData.append("refresh_token", settings.authDetails.refreshToken);
+            formData.append("refreshToken", settings.authDetails.refreshToken);
             const response = await fetch(`${settings.apiUrl}/auth/token/refresh`, {
                 method: "POST",
                 body: formData,
@@ -35,7 +35,7 @@ export class Authenticator {
             }
 
             const data = await response.json();
-            const { tokenId, accessToken, refreshToken, accessTokenExpiresAt, refreshTokenExpiresAt } = data;
+            const { tokenId, accessToken, refreshToken, accessTokenExpiresAt, refreshTokenExpiresAt } = data.details;
 
             this.persistAuthDetails(
                 tokenId,
@@ -97,18 +97,29 @@ export class Authenticator {
         return await this.authenticate();
     }
 
+    async apiFetch(path: string, init?: RequestInit): Promise<Response> {
+        const authenticated = await this.ensureAuthenticated();
+        if (!authenticated) {
+            throw new Error("Knowmeld: Authentication required");
+        }
+        const settings = this.settingsStore.get();
+        return fetch(`${settings.apiUrl}${path}`, {
+            ...init,
+            headers: {
+                Authorization: `Bearer ${this.getAccessToken()}`,
+                ...init?.headers,
+            },
+        });
+    }
+
     async disconnect(): Promise<void> {
         const settings = this.settingsStore.get();
         if (!settings.authDetails) return;
-        if (!await this.ensureAuthenticated()) return;
         const formData = new FormData();
         formData.append("token_id", settings.authDetails.tokenID);
         try {
-            const response = await fetch(`${settings.apiUrl}/auth/token/revoke`, {
+            const response = await this.apiFetch("/auth/token/revoke", {
                 method: "POST",
-                headers: {
-                    Authorization: `Bearer ${this.getAccessToken()}`,
-                },
                 body: formData,
             });
             if (!response.ok) {
@@ -130,7 +141,7 @@ export class Authenticator {
     async finishPairing(pairingCode: string, correlationId: string): Promise<boolean> {
         const settings = this.settingsStore.get();
         const formData = new FormData();
-        formData.append("pairing_code", pairingCode);
+        formData.append("pairingCode", pairingCode);
         const resp = await fetch(`${settings.apiUrl}/auth/token/pair`, {
             method: "POST",
             body: formData,

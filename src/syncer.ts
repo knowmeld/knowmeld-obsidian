@@ -15,8 +15,7 @@ enum SyncDecision {
 }
 
 interface IAuthenticator {
-  ensureAuthenticated(): Promise<boolean>;
-  getAccessToken(): string;
+  apiFetch(path: string, init?: RequestInit): Promise<Response>;
 }
 
 export interface ShouldSyncFileResult {
@@ -91,12 +90,6 @@ export class FileSyncer {
 
 
   async uploadFile(file: TFile, sessionId: string): Promise<SyncDecision> {
-    const settings = this.settingsStore.get();
-
-    if (! await this.authenticator.ensureAuthenticated()) {
-      return SyncDecision.FAILED;
-    }
-
     const content = await this.vault.read(file);
     const hash = await hashContent(content);
 
@@ -107,14 +100,13 @@ export class FileSyncer {
       const metadata = { vault_name: this.vault.getName() };
       formData.append("metadata", JSON.stringify(metadata));
       formData.append("file", blob, file.name);
-      formData.append("file_path", file.path);
+      formData.append("filePath", file.path);
       formData.append("metadata", JSON.stringify(metadata));
 
-      const response = await fetch(`${settings.apiUrl}/files/upload/file`, {
+      const response = await this.authenticator.apiFetch("/files/upload/file", {
         method: "POST",
         headers: {
-          Authorization: `Bearer ${this.authenticator.getAccessToken()}`,
-          "X-Knowmeld-Correlation-ID": sessionId,
+          "X-Correlation-ID": sessionId,
         },
         body: formData,
       });
@@ -200,15 +192,10 @@ export class FileSyncer {
 
 
   async startSync(): Promise<string | void> {
-    if (! await this.authenticator.ensureAuthenticated()) {
-      new Notice("Knowmeld: Authentication required to start sync session.");
-      return;
-    }
     try {
-      const resp = await fetch(`${this.settingsStore.get().apiUrl}/files/upload/start`, {
+      const resp = await this.authenticator.apiFetch("/files/upload/start", {
         method: "POST",
         headers: {
-          Authorization: `Bearer ${this.authenticator.getAccessToken()}`,
           "X-Idempotency-Key": crypto.randomUUID(),
         },
       });
@@ -216,7 +203,7 @@ export class FileSyncer {
         throw new Error("Authentication failed");
       }
 
-      const sessionId = resp.headers.get("X-Knowmeld-Correlation-ID");
+      const sessionId = resp.headers.get("X-Correlation-ID");
       if (!sessionId) {
         throw new Error("Knowmeld Error correlation ID missing in response");
       }
@@ -229,15 +216,10 @@ export class FileSyncer {
   }
 
   async finishSync(sessionId: string): Promise<void> {
-    if (! await this.authenticator.ensureAuthenticated()) {
-      new Notice("Knowmeld: Authentication required to finish sync session.");
-      return;
-    }
     try {
-      await fetch(`${this.settingsStore.get().apiUrl}/files/upload/complete`, {
+      await this.authenticator.apiFetch("/files/upload/complete", {
         method: "POST",
         headers: {
-          Authorization: `Bearer ${this.authenticator.getAccessToken()}`,
           "Content-Type": "application/json",
           "X-Correlation-ID": sessionId,
         },
@@ -263,7 +245,6 @@ export class FileSyncer {
   async flushDeletedDocuments(): Promise<void> {
     const settings = this.settingsStore.get();
     if (settings.deletedDocumentIds.length === 0) return;
-    if (!await this.authenticator.ensureAuthenticated()) return;
     const success = await this.sendDeletedDocuments(settings.deletedDocumentIds);
     if (success) {
       this.settingsStore.set({ deletedDocumentIds: [] });
@@ -274,14 +255,10 @@ export class FileSyncer {
   async sendDeletedDocuments(documentIds: string[]): Promise<boolean> {
     if (documentIds.length === 0) return true;
 
-    const settings = this.settingsStore.get();
-    if (!await this.authenticator.ensureAuthenticated()) return false;
-
     try {
-      const response = await fetch(`${settings.apiUrl}/files/documents`, {
+      const response = await this.authenticator.apiFetch("/files/documents", {
         method: "DELETE",
         headers: {
-          Authorization: `Bearer ${this.authenticator.getAccessToken()}`,
           "Content-Type": "application/json",
         },
         body: JSON.stringify({ document_ids: documentIds }),
