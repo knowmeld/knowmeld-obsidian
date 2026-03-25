@@ -1,22 +1,11 @@
 import { TFile, Vault, Notice, getFrontMatterInfo, App } from "obsidian";
 import { KnowmeldSettingStore } from "./settings.store";
-
-
+import { PersistedCache } from "./types";
 
 const MIN_CONTENT_LENGTH = 500;
 
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-interface PersistedCache {
-  get(path: string): string | undefined;
-  set(path: string, hash: string): void;
-  remove(path: string): void;
-  rename(oldPath: string, newPath: string): void;
-  getDocumentId(path: string): string | undefined;
-  setDocumentId(path: string, documentId: string): void;
-  save(): Promise<void>;
 }
 
 enum SyncDecision {
@@ -26,8 +15,45 @@ enum SyncDecision {
 }
 
 interface IAuthenticator {
-  ensureAuthenticated(): Promise<boolean>;
-  getAccessToken(): string;
+  apiFetch(path: string, init?: RequestInit): Promise<Response>;
+}
+
+export interface ShouldSyncFileResult {
+  shouldSync: boolean;
+  reason: string;
+}
+
+export interface ShouldSyncFileOptions {
+  path: string;
+  excludedFolders: string[];
+  contentWithoutFrontMatter?: string;
+  contentHash?: string;
+  cachedHash?: string;
+}
+
+export function shouldSyncFile(opts: ShouldSyncFileOptions): ShouldSyncFileResult {
+  const { path, excludedFolders, contentWithoutFrontMatter, contentHash, cachedHash } = opts;
+
+  if (excludedFolders.some((folder) => path.startsWith(folder))) {
+    return { shouldSync: false, reason: "path is in excluded folders" };
+  }
+  if (path.startsWith("_")) {
+    return { shouldSync: false, reason: "path starts with underscore" };
+  }
+  if (!path.endsWith(".md")) {
+    return { shouldSync: false, reason: "not a markdown file" };
+  }
+  if (contentWithoutFrontMatter !== undefined) {
+    if (contentWithoutFrontMatter.trim().length < MIN_CONTENT_LENGTH) {
+      return { shouldSync: false, reason: "content too short" };
+    }
+  }
+  if (contentHash !== undefined && cachedHash !== undefined) {
+    if (contentHash === cachedHash) {
+      return { shouldSync: false, reason: "content unchanged" };
+    }
+  }
+  return { shouldSync: true, reason: "file should be synced" };
 }
 
 export class FileSyncer {
@@ -35,7 +61,7 @@ export class FileSyncer {
   private cacheStore: PersistedCache;
   private settingsStore: KnowmeldSettingStore;
   private authenticator: IAuthenticator;
-  private app: App;
+
 
 
   constructor(app: App, vault: Vault, cacheStore: PersistedCache, settingStore: KnowmeldSettingStore, authenticator: IAuthenticator) {
@@ -43,59 +69,27 @@ export class FileSyncer {
     this.cacheStore = cacheStore;
     this.settingsStore = settingStore;
     this.authenticator = authenticator;
-    this.app = app;
   }
 
   async shouldSyncFile(file: TFile): Promise<ShouldSyncFileResult> {
     const settings = this.settingsStore.get();
-
     const content = await this.vault.read(file);
     let { contentStart } = getFrontMatterInfo(content);
     contentStart = contentStart ?? 0;
     const contentWithoutFrontMatter = content.slice(contentStart);
-    const hash = await hashContent(content);
+    const contentHash = await hashContent(content);
     const cachedHash = this.cacheStore.get(file.path);
-
-    // Check if in excluded folders
-    if (settings.excludedFolders.some((folder: string) => file.path.startsWith(folder))) {
-      return { shouldSync: false, reason: "path is in excluded folders" };
-    }
-
-    // Check if starts with underscore
-    if (file.path.startsWith("_")) {
-      return { shouldSync: false, reason: "path starts with underscore" };
-    }
-
-    // Check if markdown file
-    if (!file.path.endsWith(".md")) {
-      return { shouldSync: false, reason: "not a markdown file" };
-    }
-
-    // Check content length if provided
-    if (contentWithoutFrontMatter !== undefined) {
-      if (contentWithoutFrontMatter.trim().length < MIN_CONTENT_LENGTH) {
-        return { shouldSync: false, reason: "content too short" };
-      }
-    }
-
-    // Check if content unchanged if hashes provided
-    if (hash !== undefined && cachedHash !== undefined) {
-      if (hash === cachedHash) {
-        return { shouldSync: false, reason: "content unchanged" };
-      }
-    }
-
-    return { shouldSync: true, reason: "file should be synced" };
+    return shouldSyncFile({
+      path: file.path,
+      excludedFolders: settings.excludedFolders,
+      contentWithoutFrontMatter,
+      contentHash,
+      cachedHash,
+    });
   }
 
 
   async uploadFile(file: TFile, sessionId: string): Promise<SyncDecision> {
-    const settings = this.settingsStore.get();
-
-    if (! await this.authenticator.ensureAuthenticated()) {
-      return SyncDecision.FAILED;
-    }
-
     const content = await this.vault.read(file);
     const hash = await hashContent(content);
 
@@ -106,14 +100,13 @@ export class FileSyncer {
       const metadata = { vault_name: this.vault.getName() };
       formData.append("metadata", JSON.stringify(metadata));
       formData.append("file", blob, file.name);
-      formData.append("file_path", file.path);
+      formData.append("filePath", file.path);
       formData.append("metadata", JSON.stringify(metadata));
 
-      const response = await fetch(`${settings.apiUrl}/files/upload/file`, {
+      const response = await this.authenticator.apiFetch("/files/upload/file", {
         method: "POST",
         headers: {
-          Authorization: `Bearer ${this.authenticator.getAccessToken()}`,
-          "X-Knowmeld-Correlation-ID": sessionId,
+          "X-Correlation-ID": sessionId,
         },
         body: formData,
       });
@@ -199,15 +192,10 @@ export class FileSyncer {
 
 
   async startSync(): Promise<string | void> {
-    if (! await this.authenticator.ensureAuthenticated()) {
-      new Notice("Knowmeld: Authentication required to start sync session.");
-      return;
-    }
     try {
-      const resp = await fetch(`${this.settingsStore.get().apiUrl}/files/upload/start`, {
+      const resp = await this.authenticator.apiFetch("/files/upload/start", {
         method: "POST",
         headers: {
-          Authorization: `Bearer ${this.authenticator.getAccessToken()}`,
           "X-Idempotency-Key": crypto.randomUUID(),
         },
       });
@@ -215,7 +203,7 @@ export class FileSyncer {
         throw new Error("Authentication failed");
       }
 
-      const sessionId = resp.headers.get("X-Knowmeld-Correlation-ID");
+      const sessionId = resp.headers.get("X-Correlation-ID");
       if (!sessionId) {
         throw new Error("Knowmeld Error correlation ID missing in response");
       }
@@ -228,17 +216,12 @@ export class FileSyncer {
   }
 
   async finishSync(sessionId: string): Promise<void> {
-    if (! await this.authenticator.ensureAuthenticated()) {
-      new Notice("Knowmeld: Authentication required to finish sync session.");
-      return;
-    }
     try {
-      await fetch(`${this.settingsStore.get().apiUrl}/files/upload/complete`, {
+      await this.authenticator.apiFetch("/files/upload/complete", {
         method: "POST",
         headers: {
-          Authorization: `Bearer ${this.authenticator.getAccessToken()}`,
           "Content-Type": "application/json",
-          "X-Knowmeld-Correlation-ID": sessionId,
+          "X-Correlation-ID": sessionId,
         },
       });
       new Notice("Knowmeld: Sync session completed successfully");
@@ -259,17 +242,23 @@ export class FileSyncer {
     this.cacheStore.rename(oldPath, newPath);
   }
 
+  async flushDeletedDocuments(): Promise<void> {
+    const settings = this.settingsStore.get();
+    if (settings.deletedDocumentIds.length === 0) return;
+    const success = await this.sendDeletedDocuments(settings.deletedDocumentIds);
+    if (success) {
+      this.settingsStore.set({ deletedDocumentIds: [] });
+      await this.cacheStore.save();
+    }
+  }
+
   async sendDeletedDocuments(documentIds: string[]): Promise<boolean> {
     if (documentIds.length === 0) return true;
 
-    const settings = this.settingsStore.get();
-    if (!await this.authenticator.ensureAuthenticated()) return false;
-
     try {
-      const response = await fetch(`${settings.apiUrl}/files/documents`, {
+      const response = await this.authenticator.apiFetch("/files/documents", {
         method: "DELETE",
         headers: {
-          Authorization: `Bearer ${this.authenticator.getAccessToken()}`,
           "Content-Type": "application/json",
         },
         body: JSON.stringify({ document_ids: documentIds }),
@@ -298,8 +287,4 @@ export async function hashContent(content: string): Promise<string> {
 
 
 
-export interface ShouldSyncFileResult {
-  shouldSync: boolean;
-  reason: string;
-}
 
