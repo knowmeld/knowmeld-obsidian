@@ -28,7 +28,7 @@ export const DEFAULT_SETTINGS: KnowmeldSettings = {
         : "http://localhost:5173",
     apiUrl: process.env.NODE_ENV === "production"
         ? "https://app.knowmeld.io/api/v1"
-        : "http://localhost:8000/api/v1",
+        : "http://localhost:8280/api/v1",
     authDetails: undefined,
     excludedFolders: [],
     realtimeSyncInterval: 120,
