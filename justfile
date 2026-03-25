@@ -21,8 +21,10 @@ _bump part:
 
     git add manifest.json package.json
     git commit -m "chore: release $tag"
-    git tag "$tag"
-    git push origin HEAD:main --follow-tags
+    # Use an annotated tag so pushing tags is deterministic and compatible with --follow-tags semantics.
+    git tag -a "$tag" -m "Release $tag"
+    git push origin HEAD:main
+    git push origin "$tag"
 
     echo "Pushed $tag — release workflow will trigger shortly."
 
